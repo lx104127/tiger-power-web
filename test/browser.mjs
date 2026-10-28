@@ -8,7 +8,8 @@ const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PAT
 const failures = [];
 try {
   await mkdir("artifacts", { recursive: true });
-  const page = await browser.newPage({ locale: "zh-CN", viewport: { width: 1440, height: 1000 } });
+  const context = await browser.newContext({ locale: "zh-CN", viewport: { width: 1440, height: 1000 } });
+  const page = await context.newPage();
   page.on("pageerror", error => failures.push(error.message));
   // Keep market polling deterministic and offline; wallet endpoints still use
   // the real server and its isolated, explicitly test-only CLI process.
@@ -21,6 +22,21 @@ try {
   await page.screenshot({ path: "artifacts/web-login-desktop.png", fullPage: true });
   await page.locator("#password").fill(testPassword); await page.locator("#submit").click();
   await page.waitForURL(app.origin + "/");
+  const siteCookie = (await page.context().cookies(app.origin)).find(c => c.name === "tiger_session");
+  assert.ok(siteCookie?.httpOnly);
+  assert.ok(Math.abs(siteCookie.expires - Date.now() / 1000 - 6 * 3600) < 10);
+  // Refreshing, changing screens and opening a new tab keep the same login.
+  for (const path of ["/", "/scan", "/track", "/"]) {
+    await page.goto(app.origin + path);
+    await page.reload();
+    assert.equal(new URL(page.url()).pathname, path);
+    await page.locator(".site-lock").waitFor();
+  }
+  const reopened = await page.context().newPage();
+  await reopened.goto(app.origin + "/login");
+  await reopened.waitForURL(app.origin + "/");
+  await reopened.close();
+  assert.equal((await page.context().cookies(app.origin)).find(c => c.name === "tiger_session").value, siteCookie.value);
   await page.locator('#wchips [data-login="1"]').waitFor();
   await page.locator('#wchips [data-login="2"]').waitFor();
   await page.locator('#wchips [data-login="1"]').click();

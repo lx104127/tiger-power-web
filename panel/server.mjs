@@ -71,6 +71,7 @@ const passwordFile = statePath("website-password.hash");
 let savedPasswordHash;
 try { savedPasswordHash = readFileSync(passwordFile, "utf8").trim(); } catch {}
 const access = createAccess({ port: PORT, env: { ...process.env, PANEL_PASSWORD_HASH: process.env.PANEL_PASSWORD_HASH || savedPasswordHash },
+  sessionFile: statePath("website-sessions.json"),
   persistPasswordHash: hash => writeFileSync(passwordFile, hash, { mode: 0o600, flag: "wx" }) });
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const AGENTBUY = here("../");

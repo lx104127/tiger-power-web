@@ -29,5 +29,5 @@
     "ws": "$ws",
     "basic-ftp": "6.2.3"
   },
-  "version": "2.0.0"
+  "version": "2.0.1"
 }

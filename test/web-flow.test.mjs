@@ -7,7 +7,7 @@ import { startFixture, testPassword } from "./helpers.mjs";
 test("website authentication gates trading; wallet login, address pinning and logout remain isolated", async t => {
   const app = await startFixture(); t.after(() => app.stop());
   const health = await fetch(app.origin + "/health").then(r => r.json());
-  assert.equal(health.version, "2.0.0"); assert.deepEqual(Object.keys(health).sort(), ["commit", "ok", "version"]);
+  assert.equal(health.version, "2.0.1"); assert.deepEqual(Object.keys(health).sort(), ["commit", "ok", "version"]);
   const request = (path, data, headers = {}) => fetch(app.origin + path, { method: "POST", headers: { origin: app.origin, "content-type": "application/json", ...headers }, body: JSON.stringify(data) });
   assert.equal((await fetch(app.origin, { redirect: "manual" })).status, 303);
   for (const route of ["/api/wallets", "/api/run", "/api/login/start", "/api/copy", "/api/copy/tasks", "/api/copy/pause-all", "/api/cache-status"]) assert.equal((await request(route, {})).status, 401);

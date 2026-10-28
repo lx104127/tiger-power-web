@@ -1,9 +1,10 @@
 import { randomBytes, scrypt, timingSafeEqual, createHash } from "node:crypto";
 import { promisify } from "node:util";
+import { readFileSync } from "node:fs";
+import { writePrivateJson } from "./private-json.mjs";
 
 const derive = promisify(scrypt);
-const TTL = 12 * 60 * 60_000;
-const IDLE = 30 * 60_000;
+const TTL = 6 * 60 * 60_000;
 const WINDOW = 15 * 60_000;
 const COOKIE = "tiger_session";
 export async function hashPassword(password) {
@@ -25,7 +26,7 @@ function cookieValue(req) {
   return /^[a-f0-9]{64}$/.test(value) ? value : null;
 }
 
-export function createAccess({ env = process.env, port = 4400, now = Date.now, persistPasswordHash } = {}) {
+export function createAccess({ env = process.env, port = 4400, now = Date.now, persistPasswordHash, sessionFile } = {}) {
   const web = env.PANEL_MODE === "web";
   let passwordHash = env.PANEL_PASSWORD_HASH;
   let setupKey = env.PANEL_SETUP_KEY;
@@ -42,11 +43,35 @@ export function createAccess({ env = process.env, port = 4400, now = Date.now, p
       throw new Error("PANEL_PUBLIC_URL 必须为 HTTPS 根地址（本机测试可用 HTTP）");
     }
   }
-  const sessions = new Map(), attempts = new Map();
+  let sessions = new Map();
+  const attempts = new Map();
+  // Persist only token digests, bound to this password and public origin.
+  // A fixed deadline keeps refreshes and background polling from extending it.
+  const binding = () => digest(`${origin.origin}\n${passwordHash}`);
+  if (web && sessionFile && validHash(passwordHash)) {
+    let saved;
+    try { saved = JSON.parse(readFileSync(sessionFile, "utf8")); }
+    catch (error) {
+      if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw new Error("无法读取网站登录状态", { cause: error });
+    }
+    if (saved?.version === 1 && saved.binding === binding() && Array.isArray(saved.sessions)) {
+      for (const entry of saved.sessions.slice(-100)) {
+        if (!entry || !/^[a-f0-9]{64}$/.test(entry.id || "") || !/^[a-f0-9]{48}$/.test(entry.csrf || "")) continue;
+        if (!Number.isSafeInteger(entry.issued) || !Number.isSafeInteger(entry.expires) || entry.issued > now() || entry.expires - entry.issued !== TTL || entry.expires <= now()) continue;
+        sessions.set(entry.id, { csrf: entry.csrf, issued: entry.issued, expires: entry.expires });
+      }
+    }
+  }
+  function commitSessions(next) {
+    if (web && sessionFile) {
+      writePrivateJson(sessionFile, { version: 1, binding: binding(), sessions: Array.from(next, ([id, value]) => ({ id, ...value })) });
+    }
+    sessions = next;
+  }
   const secure = origin?.protocol === "https:";
   const cookie = (value, age) => `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${secure ? "; Secure" : ""}`;
   const prune = () => {
-    for (const [key, value] of sessions) if (value.expires <= now() || value.seen + IDLE <= now()) sessions.delete(key);
+    for (const [key, value] of sessions) if (value.expires <= now()) sessions.delete(key);
     for (const [key, value] of attempts) if (value.until <= now()) attempts.delete(key);
   };
   function checkOrigin(req) {
@@ -61,7 +86,6 @@ export function createAccess({ env = process.env, port = 4400, now = Date.now, p
     prune();
     const value = cookieValue(req);
     const s = value ? sessions.get(digest(value)) : null;
-    if (s) s.seen = now();
     return s || null;
   }
   async function signin(req, res, password) {
@@ -73,17 +97,24 @@ export function createAccess({ env = process.env, port = 4400, now = Date.now, p
     a.count++; attempts.set(ip, a);
     if (!(await verifyPassword(password, passwordHash))) return { status: 401, data: { error: "网站密码不正确" } };
     attempts.delete(ip);
+    const next = new Map(sessions);
     const old = cookieValue(req);
-    if (old) sessions.delete(digest(old));
-    if (sessions.size >= 100) sessions.delete(sessions.keys().next().value);
+    if (old) next.delete(digest(old));
+    if (next.size >= 100) next.delete(next.keys().next().value);
     const token = randomBytes(32).toString("hex");
-    sessions.set(digest(token), { csrf: randomBytes(24).toString("hex"), expires: now() + TTL, seen: now() });
+    const issued = now();
+    next.set(digest(token), { csrf: randomBytes(24).toString("hex"), issued, expires: issued + TTL });
+    commitSessions(next);
     res.setHeader("Set-Cookie", cookie(token, TTL / 1000));
     return { status: 200, data: { ok: true } };
   }
   function signout(req, res) {
     const token = cookieValue(req);
-    if (token) sessions.delete(digest(token));
+    if (token && sessions.has(digest(token))) {
+      const next = new Map(sessions);
+      next.delete(digest(token));
+      commitSessions(next);
+    }
     res.setHeader("Set-Cookie", cookie("", 0));
   }
   async function setup(req, res, input) {

@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { createAccess, hashPassword } from "../panel/web-auth.mjs";
 
 test("web mode requires a password and HTTPS outside loopback", async () => {
@@ -8,8 +12,9 @@ test("web mode requires a password and HTTPS outside loopback", async () => {
   assert.throws(() => createAccess({ env: { PANEL_MODE: "web", PANEL_PASSWORD_HASH: hash, PANEL_PUBLIC_URL: "http://example.com" } }), /HTTPS/);
   await assert.rejects(hashPassword("short"), /12/);
 });
-test("cookies are protected, CSRF is unique, idle/absolute expiry and logout work", async () => {
+test("website login lasts six hours without an idle cutoff; refresh does not extend it and logout revokes it", async () => {
   let time = Date.now();
+  const issued = time;
   const env = { PANEL_MODE: "web", PANEL_PASSWORD_HASH: await hashPassword("test-password-123456"), PANEL_PUBLIC_URL: "https://trade.example.com" };
   const access = createAccess({ env, now: () => time });
   const req = { headers: { host: "trade.example.com", origin: "https://trade.example.com", "content-type": "application/json" }, socket: { remoteAddress: "127.0.0.1" }, method: "POST" };
@@ -17,15 +22,69 @@ test("cookies are protected, CSRF is unique, idle/absolute expiry and logout wor
   assert.equal((await access.signin(req, res, "wrong")).status, 401);
   assert.equal((await access.signin(req, res, "test-password-123456")).status, 200);
   assert.match(cookie, /HttpOnly; SameSite=Strict/); assert.match(cookie, /Secure/);
+  assert.match(cookie, /Max-Age=21600(?:;|$)/);
   req.headers.cookie = cookie.split(";")[0];
   const s = access.session(req); assert.match(s.csrf, /^[a-f0-9]{48}$/);
-  time += 31 * 60_000; assert.equal(access.session(req), null);
+  time += 31 * 60_000; assert.equal(access.session(req), s);
+  time = issued + 6 * 3600_000 - 1; assert.equal(access.session(req), s);
+  time++; assert.equal(access.session(req), null);
   await access.signin(req, res, "test-password-123456"); req.headers.cookie = cookie.split(";")[0];
-  time += 12 * 3600_000; assert.equal(access.session(req), null);
-  await access.signin(req, res, "test-password-123456"); req.headers.cookie = cookie.split(";")[0];
+  assert.notEqual(access.session(req).csrf, s.csrf);
   assert.ok(access.session(req)); access.signout(req, res); assert.equal(access.session(req), null);
+  assert.match(cookie, /Max-Age=0(?:;|$)/);
   assert.throws(() => access.checkOrigin({ ...req, headers: { ...req.headers, origin: "https://evil.example" } }), /Origin/);
   assert.throws(() => access.checkOrigin({ ...req, headers: { ...req.headers, host: "evil.example" } }), /Host/);
+});
+test("private sessions survive a restart for the original six hours and logout stays revoked after restart", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "tiger-session-test-")); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sessionFile = join(dir, "website-sessions.json");
+  let time = Date.now(); const issued = time;
+  const env = { PANEL_MODE: "web", PANEL_PASSWORD_HASH: await hashPassword("test-password-123456"), PANEL_PUBLIC_URL: "https://trade.example.com" };
+  const options = { env, now: () => time, sessionFile };
+  const access = createAccess(options);
+  const req = { headers: {}, socket: { remoteAddress: "127.0.0.1" } };
+  let cookie; const res = { setHeader: (_, value) => cookie = value };
+  await access.signin(req, res, "test-password-123456"); req.headers.cookie = cookie.split(";")[0];
+  const token = req.headers.cookie.split("=")[1];
+  const saved = readFileSync(sessionFile, "utf8");
+  assert.ok(!saved.includes(token)); assert.ok(!saved.includes("test-password-123456")); assert.ok(!saved.includes(env.PANEL_PASSWORD_HASH));
+  assert.equal(statSync(sessionFile).mode & 0o777, 0o600);
+  assert.equal(JSON.parse(saved).sessions[0].id, createHash("sha256").update(token).digest("hex"));
+  const csrf = access.session(req).csrf;
+  const otherReq = { headers: {}, socket: req.socket };
+  await access.signin(otherReq, res, "test-password-123456"); otherReq.headers.cookie = cookie.split(";")[0];
+  time += 2 * 3600_000;
+  const restarted = createAccess(options);
+  assert.equal(restarted.session(req).csrf, csrf);
+  assert.equal(restarted.session(req).expires, issued + 6 * 3600_000);
+  restarted.signout(req, res);
+  assert.equal(createAccess(options).session(req), null);
+  assert.ok(createAccess(options).session(otherReq));
+  time = issued + 6 * 3600_000;
+  assert.equal(createAccess(options).session(otherReq), null);
+});
+test("sessions cannot move between passwords or sites, and malformed or overlong records do not authenticate", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "tiger-session-test-")); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sessionFile = join(dir, "website-sessions.json");
+  const env = { PANEL_MODE: "web", PANEL_PASSWORD_HASH: await hashPassword("test-password-123456"), PANEL_PUBLIC_URL: "https://trade.example.com" };
+  const options = { env, sessionFile };
+  const req = { headers: {}, socket: { remoteAddress: "127.0.0.1" } };
+  let cookie; await createAccess(options).signin(req, { setHeader: (_, value) => cookie = value }, "test-password-123456"); req.headers.cookie = cookie.split(";")[0];
+  assert.equal(createAccess({ ...options, env: { ...env, PANEL_PUBLIC_URL: "https://other.example.com" } }).session(req), null);
+  assert.equal(createAccess({ ...options, env: { ...env, PANEL_PASSWORD_HASH: await hashPassword("another-password-123456") } }).session(req), null);
+  const saved = JSON.parse(readFileSync(sessionFile, "utf8"));
+  saved.sessions[0].expires += 1; writeFileSync(sessionFile, JSON.stringify(saved));
+  assert.equal(createAccess(options).session(req), null);
+  writeFileSync(sessionFile, "{invalid");
+  assert.equal(createAccess(options).session(req), null);
+});
+test("a session storage failure does not issue a login cookie", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "tiger-session-test-")); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const env = { PANEL_MODE: "web", PANEL_PASSWORD_HASH: await hashPassword("test-password-123456"), PANEL_PUBLIC_URL: "https://trade.example.com" };
+  const access = createAccess({ env, sessionFile: join(dir, "missing", "website-sessions.json") });
+  let setCookie = false;
+  await assert.rejects(access.signin({ headers: {}, socket: { remoteAddress: "127.0.0.1" } }, { setHeader() { setCookie = true; } }, "test-password-123456"));
+  assert.equal(setCookie, false);
 });
 test("incorrect passwords are rate limited", async () => {
   const access = createAccess({ env: { PANEL_MODE: "web", PANEL_PASSWORD_HASH: await hashPassword("test-password-123456"), PANEL_PUBLIC_URL: "https://trade.example.com" } });

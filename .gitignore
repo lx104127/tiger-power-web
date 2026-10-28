@@ -43,6 +43,8 @@ artifacts/
 **/session.json
 **/instance-id
 **/website-password.hash
+**/website-sessions.json
+**/website-sessions.json.*.tmp
 **/website-setup.json
 **/temporary-entry.json
 **/temporary-origin.json
