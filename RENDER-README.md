@@ -1,5 +1,7 @@
 # Render 固定网址部署
 
+V2 更新时保持现有服务和持久磁盘，使用 **Manual Deploy → Deploy latest commit**；具体功能和核对步骤见 [RELEASE-V2.md](RELEASE-V2.md)。
+
 用于一个人管理两个 Binance Agentic Wallet 账号。部署使用当前修复后的版本，源码仓库为 `https://github.com/lx104127/tiger-power-web`。
 
 ## 在 Render 创建网站

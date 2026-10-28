@@ -8,7 +8,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { logRpc, HAS_PRIVATE, PUBLIC_WINDOW } from "./logrpc.mjs";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { provider, dexUsd } from "./detect.mjs";
+import { provider, dexUsd, divOf } from "./detect.mjs";
+import { gatedList, portalState, metaOf, markDex, FLAP_PORTAL, portalStateCall, parsePortalState } from "./flapnft.mjs";
 import { kickGmgn, gmgnInfo, gmgnStatus } from "./enrich.mjs";
 
 const CACHE = statePath("panel/scan-cache.json");
@@ -209,6 +210,7 @@ async function idAgentRows() {
 }
 
 // ---------- Gang ----------
+const isXaut = (a) => String(a || "").toLowerCase() === "0x21caef8a43163eea865baee23b9c2e327696a3bf";
 async function gangRows() {
   const get = async (path) => {
     let out = [];
@@ -220,22 +222,40 @@ async function gangRows() {
     }
     return out;
   };
-  const [v1, v2] = await Promise.all([get("/tokens?sort=new"), get("/stocks/tokens")]);
+  const [v1, v2, v3] = await Promise.all([get("/tokens?sort=new"), get("/stocks/tokens"), get("/v3/tokens").catch(() => [])]);
   // gang.fun 给不出美元价的底池币(Ondo 代币化股票 FXIon 等,fdvUsd = 0):按底池币地址用 DexScreener 补
   const qUsd = {};
   for (const q of [...new Set(v2.filter((t) => !Number(t.quoteUsd) && t.quoteAddress).map((t) => t.quoteAddress.toLowerCase()))]) qUsd[q] = await dexUsd(q).catch(() => null);
   const usdOf = (t) => qUsd[String(t.quoteAddress || "").toLowerCase()] || null;
+  // gang.fun 接口按 18 位格式化底池币金额:XAUt(6 位)的筹集额 / 价格 / 成交额会小 10^12 倍,这里换回来
+  const qk = (t) => (isXaut(t.quoteAddress) ? 1e12 : 1);
   const row = (t, isV2) => ({
     platform: isV2 ? "gangv2" : "gangv1", platformLabel: isV2 ? "Gang V2" : "Gang", ca: t.address.toLowerCase(), name: t.name, symbol: t.symbol,
-    quote: isV2 ? t.quoteSymbol : "BNB", progress: Number(t.progressPct), raised: Number(isV2 ? t.raisedQuote : t.raisedBnb),
-    mcap: Number(isV2 ? t.priceQuote : t.priceBnb) * 1e9 || Number(t.fdvBnb) || null, volume: Number(t.volume24hBnb ?? 0) || null, volumeLabel: "24h",
-    mcapUsd: Number(t.fdvUsd) || (isV2 && usdOf(t) ? Number(t.priceQuote) * 1e9 * usdOf(t) : null) || null,
-    volumeUsd: Number(t.volume24hUsd) || (isV2 && usdOf(t) ? Number(t.volume24hQuote || 0) * usdOf(t) : null) || null,
+    quote: isV2 ? t.quoteSymbol : "BNB", progress: Number(t.progressPct), raised: Number(isV2 ? t.raisedQuote : t.raisedBnb) * (isV2 ? qk(t) : 1),
+    mcap: Number(isV2 ? t.priceQuote : t.priceBnb) * 1e9 * (isV2 ? qk(t) : 1) || Number(t.fdvBnb) || null, volume: Number(t.volume24hBnb ?? 0) || null, volumeLabel: "24h",
+    mcapUsd: Number(t.fdvUsd) || (isV2 && usdOf(t) ? Number(t.priceQuote) * qk(t) * 1e9 * usdOf(t) : null) || null,
+    volumeUsd: Number(t.volume24hUsd) || (isV2 && usdOf(t) ? Number(t.volume24hQuote || 0) * qk(t) * usdOf(t) : null) || null,
     txs: t.trades ?? null, holders: t.holders ?? null, graduated: !!t.graduated, createdAt: t.createdAt ?? null, graduatedAt: t.graduatedAt ?? null,
-    lastTradeAt: t.lastTradeAt ?? null, taxed: !!t.taxed,
+    lastTradeAt: t.lastTradeAt ?? null, taxed: !!t.taxed, dividend: t.taxed === undefined ? null : !!t.taxed, div: divOf(t.dividends),
     creator: String(t.creator || "").toLowerCase() || null, creatorHandle: t.creatorHandle || null, feeBuy: 1, feeSell: 1, postTax: t.taxed ? Number(t.taxBps || 0) / 100 : 0,
   });
-  return [...v1.map((t) => row(t, false)), ...v2.map((t) => row(t, true))];
+  // V3:接口给的是原始单位(realQuote)和底池币单位的价格;WBNB 底池按 BNB 价换美元,其他底池币用 DexScreener
+  const bnbPx = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", { signal: AbortSignal.timeout(8000) }).then((r) => r.json()).then((j) => Number(j.price)).catch(() => null);
+  for (const q of [...new Set(v3.filter((t) => t.quoteSymbol !== "WBNB" && t.quoteAddress).map((t) => t.quoteAddress.toLowerCase()))]) if (!(q in qUsd)) qUsd[q] = await dexUsd(q).catch(() => null);
+  const row3 = (t) => {
+    const wb = t.quoteSymbol === "WBNB", px = wb ? bnbPx : qUsd[String(t.quoteAddress || "").toLowerCase()] ?? null, price = Number(t.priceQuote) || 0;
+    return {
+      platform: "gangv3", platformLabel: "Gang V3", ca: t.address.toLowerCase(), name: t.name, symbol: t.symbol, quote: wb ? "BNB" : t.quoteSymbol,
+      progress: Number(t.progressPct), raised: Number(t.realQuote || 0) / 10 ** Number(t.quoteDecimals ?? 18), mcap: price * 1e9 || null,
+      mcapUsd: price && px ? price * 1e9 * px : null, volume: Number(t.volume24hQuote ?? 0) || null, volumeLabel: "24h",
+      volumeUsd: px && t.volume24hQuote ? Number(t.volume24hQuote) * px : null,
+      txs: t.trades ?? null, holders: null, graduated: !!t.graduated, createdAt: t.createdAt ?? null, graduatedAt: t.graduatedAt ?? null, lastTradeAt: t.lastActivityAt ?? null,
+      taxed: Number(t.buyTaxBps) > 0 || Number(t.sellTaxBps) > 0, dividend: Number(t.dividendBps) > 0, dividendPct: Number(t.dividendBps) / 100,
+      creator: String(t.creator || "").toLowerCase() || null, creatorHandle: t.creatorHandle || null, feeBuy: 1, feeSell: 1,
+      postTaxBuy: Number(t.buyTaxBps) / 100, postTaxSell: Number(t.sellTaxBps) / 100,
+    };
+  };
+  return [...v1.map((t) => row(t, false)), ...v2.map((t) => row(t, true)), ...v3.map(row3)];
 }
 
 // ---------- 已开盘的 four / Flap 内盘:外盘实时市值(DexScreener,30 个一批,1 分钟一次) ----------
@@ -279,12 +299,53 @@ export async function scan({ force = false } = {}) {
   if (!fresh) fresh = scanFresh().finally(() => (fresh = null));
   return fresh;
 }
+// ---------- Flap 门槛盘(Agent ID 等 NFT 门槛,登记表来自 Portal 链上事件) ----------
+async function flapRows(c) {
+  const list = gatedList();
+  // 还在内盘的门槛盘:一次 multicall 读完所有状态(以前一个盘一个请求,和别的扫链请求挤在一起会被节点限流)
+  const live = list.filter((g) => !g.dex);
+  const states = new Map();
+  if (live.length) {
+    const res = await multicall(live.map((g) => [FLAP_PORTAL, portalStateCall(g.ca)]));
+    live.forEach((g, i) => { if (res[i]?.success) { try { states.set(g.ca, parsePortalState(res[i].returnData)); } catch {} } });
+  }
+  const rows = [];
+  for (let i = 0; i < list.length; i += 10) {
+    rows.push(...(await Promise.all(list.slice(i, i + 10).map(async (g) => {
+      const st = g.dex ? null : states.get(g.ca) ?? null;
+      if (st?.status === 4) markDex(g.ca);
+      const graduated = !!g.dex || st?.status === 4;
+      const m = await metaOf(g.ca);
+      let quote = "BNB", qUsd = null;
+      if (st?.quote) { quote = (await metaOf(st.quote).catch(() => null))?.symbol ?? "?"; qUsd = await dexUsd(st.quote.toLowerCase()).catch(() => null); }
+      return {
+        platform: "flapportal", platformLabel: "Flap 门槛", ca: g.ca, name: m.name, symbol: m.symbol, quote, nftGate: g.nft,
+        progress: graduated ? 100 : st?.progress ?? null, mcap: st?.price ? st.price * 1e9 : null, mcapUsd: st?.price && qUsd ? st.price * 1e9 * qUsd : null,
+        graduated, createdAt: c && g.block ? tsOf(c, g.block) : null, graduatedAt: c && g.dexBlock ? tsOf(c, g.dexBlock) : null, lastTradeAt: null,
+      };
+    }))));
+  }
+  return rows;
+}
+// 某一组(Gang / Flap 内盘 / 门槛盘)这一轮没拉下来:先用上一次的数据,提示只写一句人话(原始报错打到日志里)
+const lastGood = {};
+function group(name, fn, errors) {
+  return fn().then((rows) => { lastGood[name] = rows; return rows; }).catch((e) => {
+    const msg = String(e?.message ?? e);
+    console.error(`[扫链] ${name} 没刷新:`, msg.slice(0, 300));
+    const why = /rate limit|-32005|429|Too Many/i.test(msg) ? "节点限流" : /timeout|ETIMEDOUT|aborted/i.test(msg) ? "超时" : "出错";
+    errors.push(`${name}:${why}${lastGood[name] ? ",先显示上次的数据" : ",稍后自动重试"}`);
+    return lastGood[name] ?? [];
+  });
+}
 async function scanFresh() {
   const errors = [];
-  const [gang, idAgent] = await Promise.all([
-    gangRows().catch((e) => (errors.push("Gang:" + e.message), [])),
-    idAgentRows().catch((e) => (errors.push("Flap 内盘:" + e.message), [])),
-    syncFour().catch((e) => errors.push("four:" + e.message)),
+  const c0 = await blockTime().catch(() => null);
+  const [gang, idAgent, flapG] = await Promise.all([
+    group("Gang", gangRows, errors),
+    group("Flap 内盘", idAgentRows, errors),
+    group("Flap 门槛盘", () => flapRows(c0), errors),
+    syncFour().catch((e) => { const m = String(e?.message ?? e); console.error("[扫链] four 没刷新:", m.slice(0, 300)); errors.push("four:" + (/rate limit|-32005|429|Too Many/i.test(m) ? "节点限流" : /timeout|aborted/i.test(m) ? "超时" : "出错") + ",先显示已有的数据"); }),
   ]);
   const c = await blockTime().catch(() => null);
   const fourRows = Object.values(four.tokens).map((t) => ({
@@ -300,14 +361,14 @@ async function scanFresh() {
   const bnbUsd = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", { signal: AbortSignal.timeout(8000) }).then((r) => r.json()).then((j) => Number(j.price)).catch(() => null);
   kickGmgn();
   // 底池是 BNB 的,用 BNB 价把市值 / 成交额换成美元(Gang 接口自己给了美元值)
-  for (const t of [...fourRows, ...idAgent]) if (t.quote === "BNB" && bnbUsd) {
+  for (const t of [...fourRows, ...idAgent, ...flapG]) if (t.quote === "BNB" && bnbUsd) {
     if (t.mcap) t.mcapUsd = t.mcap * bnbUsd;
     if (t.volume) t.volumeUsd = t.volume * bnbUsd;
   }
   syncIdBorn(idAgent.length);   // 后台补,不等
   for (const t of idAgent) { const b = idBorn.map[String(t.market).toLowerCase()]; if (b && c) t.createdAt = tsOf(c, b); }
   // 已开盘的 four / Flap 内盘:换成外盘实时市值和 24h 成交额(第一次等它拉完,之后后台每分钟更新)
-  const grads = [...fourRows, ...idAgent].filter((t) => t.graduated && t.ca);
+  const grads = [...fourRows, ...idAgent, ...flapG].filter((t) => t.graduated && t.ca);
   const p = dexUpdate(grads.map((t) => t.ca));
   if (!dexAt && p) await p;
   for (const t of grads) {
@@ -316,7 +377,7 @@ async function scanFresh() {
     t.mcapUsd = d?.mc ?? null;
     if (d) { t.volumeUsd = d.vol; t.volumeLabel = "24h"; t.dexLiqUsd = d.liq; t.dex = d.dex; }
   }
-  const tokens = [...gang, ...fourRows, ...idAgent];
+  const tokens = [...gang, ...fourRows, ...idAgent, ...flapG];
   for (const t of tokens) {
     const g = gmgnInfo(t.ca);
     if (!g) continue;
@@ -338,6 +399,8 @@ export function scanLite(data) {
       ca: t.ca, symbol: t.symbol, name: t.name, platform: t.platform, platformLabel: t.platformLabel, index: t.index, creator: t.creator,
       progress: t.progress, graduated: t.graduated, createdAt: t.createdAt, graduatedAt: t.graduatedAt, lastTradeAt: t.lastTradeAt,
       mcapUsd: t.mcapUsd, holders: t.holders, gmgn: t.gmgn ? { mcapUsd: t.gmgn.mcapUsd } : undefined,
+      // 交易页左侧扫链栏的标签用
+      quote: t.quote, postTax: t.postTax, postTaxBuy: t.postTaxBuy, postTaxSell: t.postTaxSell, dividend: t.dividend, dividendPct: t.dividendPct, nftGate: t.nftGate ? true : undefined, anti: t.anti || undefined,
     })),
   };
 }

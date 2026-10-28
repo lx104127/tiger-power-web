@@ -1,3 +1,5 @@
+> **Tiger Power Web V2 正式版**：已合并上游 1.2.0 的 Gang v3、Flap NFT 门槛盘、跟单及分红标签。发布说明见 [RELEASE-V2.md](RELEASE-V2.md)。
+
 > **双钱包网页版**：浏览器网站登录、两个 Binance 账号独立扫码、一键启动和部署说明见 [WEB-README.md](WEB-README.md)。原始本机用法仍保留如下。
 
 > **Render 固定网址部署**：导入本仓库的 Blueprint，按 [RENDER-README.md](RENDER-README.md) 创建带持久磁盘的网站。费用、地区与平台实际验收须在创建前核对。
@@ -51,6 +53,10 @@ npm ci
 ```vbs
 CreateObject("WScript.Shell").Run "wscript ""D:\agentbuy\panel\daemon.vbs""", 0, False
 ```
+
+### 网络连接
+
+网站沿用托管平台的出站网络和已配置的 HTTP(S) 代理，并保留 TLS 证书验证。网络不可达时显示实际错误；部署地区须符合币安服务和账号使用条件。可按 `.env.example` 配置自己的 RPC。
 
 ### 可选:`.env`(推荐配一个自己的节点)
 
@@ -122,6 +128,15 @@ four 脚本没有 `--acct`,账号 2 用 `four2.cmd fourbuy <CA> <BNB>` / `four2.
 双击 `gang/v3watch-run.cmd`(或 `node gang/v3watch.mjs`)**只监控、不下单**:Gang 部署钱包部署新合约、陌生合约发出 Gang 建币事件、gang.fun 接口 / 前端 / 官方 CLI 出现新发射台时推 Telegram。
 
 `gang/v3watch-autobuy.cmd` 额外开启**自动买入**:新发射台上的前 3 个币,两个号各买 1%(每个号每个币折合超过 0.2 BNB 就不买)。每一笔照样先模拟 + 过币安风控,有风险提示或要去 App 批准的不会提交。注意:Gang 新版合约(V3 / 打新)的买入方式和 V2 不同,自动买入目前按 V2 方式下单,新版上线后可能买不进,请以 Telegram 推送为准、必要时手动买。
+
+### 更新提醒
+
+面板每 6 小时看一次 GitHub 上的 `version.json`(GitHub 打不开时改用 jsDelivr),有**重大更新**时页面左下角会提示,点开能看到更新内容和更新方法;双击 `start.cmd` 时启动检查也会提醒一句。只读一个公开的版本号文件,不会自动下载或运行任何东西。更新方法:
+
+- 用 git 下载的:在项目文件夹运行 `git pull`,再重新双击 `start.cmd`。
+- 下载压缩包的:下载最新压缩包,解压覆盖到原来的文件夹(`.env`、登录信息和 panel 里的数据文件不在压缩包里,不会被覆盖),再重新双击 `start.cmd`。
+
+不想要提醒:`.env` 里加一行 `AGENTBUY_NO_UPDATE_CHECK=1`。每次更新的内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 三、安全规则(脚本里写死的)
 

@@ -72,6 +72,8 @@ export async function addresses() {
 
 // ---------- 扫码登录 ----------
 const logins = {};   // acct → { state: pending|ok|fail|expired, url, code, expireAt, svg, address, error, ps }
+const NET_ERR = /timeout|timed out|ECONN|ENOTFOUND|EAI_AGAIN|NETWORK_ERROR|fetch failed|socket|connect/i;
+const NET_HINT = () => "\n\n请检查托管服务到币安的网络连接和已配置代理；保留 TLS 证书校验。";
 const starting = new Map();
 export async function loginStart(acct) {
   if (starting.has(acct)) return starting.get(acct);
@@ -87,7 +89,10 @@ async function beginLogin(acct) {
   if (!s.installed && acct === "1") throw new Error(`调不起 baw:${s.error ?? ""}。先装:npm i -g @binance/agentic-wallet`);
   logins[acct]?.ps?.kill();
   const r = await bawJson(acct, ["auth", "signin"], 30_000);
-  if (!r.success || !r.data?.qrCodeId) throw new Error("生成登录二维码失败:" + (r.error?.message ?? JSON.stringify(r).slice(0, 200)));
+  if (!r.success || !r.data?.qrCodeId) {
+    const msg = r.error?.message ?? JSON.stringify(r).slice(0, 200);
+    throw new Error("生成登录二维码失败:" + msg + (NET_ERR.test(msg) ? NET_HINT() : ""));
+  }
   const { qrCodeId, expireAt, urlForWeb, pairingCode } = r.data;
   const url = new URL(urlForWeb);
   if (url.protocol !== "https:" || !(url.hostname === "binance.com" || url.hostname.endsWith(".binance.com"))) throw new Error("Binance 返回的登录链接不受支持");

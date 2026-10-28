@@ -29,3 +29,6 @@ auto-state.json
 **/website-setup.json
 **/temporary-entry.json
 **/temporary-origin.json
+**/*.db
+**/*.db-wal
+**/*.db-shm

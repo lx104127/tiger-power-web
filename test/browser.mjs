@@ -8,7 +8,7 @@ const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PAT
 const failures = [];
 try {
   await mkdir("artifacts", { recursive: true });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  const page = await browser.newPage({ locale: "zh-CN", viewport: { width: 1440, height: 1000 } });
   page.on("pageerror", error => failures.push(error.message));
   // Keep market polling deterministic and offline; wallet endpoints still use
   // the real server and its isolated, explicitly test-only CLI process.
@@ -65,9 +65,29 @@ try {
   tradeScenario = "rejected"; await exerciseOrder();
   assert.equal(await page.locator("#ordS").textContent(), "失败");
   assert.equal(interceptedTrades, 3);
+  // The v2 screens use deterministic token metadata; no buy button is clicked.
+  const v2Tokens = [
+    { ca: "0x3333333333333333333333333333333333333333", symbol: "V3-FIXTURE", name: "V3 Fixture", platform: "gangv3", stage: "inner", quote: "BNB", progress: 20, createdAt: Math.floor(Date.now() / 1000), mcapUsd: 10000, dividend: true, dividendPct: 60, postTaxBuy: 2, postTaxSell: 3 },
+    { ca: "0x4444444444444444444444444444444444444444", symbol: "NFT-FIXTURE", name: "NFT Fixture", platform: "flapportal", stage: "inner", quote: "BNB", progress: 25, createdAt: Math.floor(Date.now() / 1000), mcapUsd: 12000, nftGate: "0x5555555555555555555555555555555555555555" },
+  ];
+  await page.unroute("**/api/scan");
+  await page.route("**/api/scan", route => route.fulfill({ json: { tokens: v2Tokens, errors: [], at: Date.now(), bnbUsd: 600 } }));
+  await page.goto(app.origin + "/scan");
+  await page.getByText("V3-FIXTURE", { exact: true }).first().waitFor();
+  await page.getByText("NFT-FIXTURE", { exact: true }).first().waitFor();
+  await page.getByText("分红 60%", { exact: true }).first().waitFor();
+  await page.getByText("需 NFT", { exact: true }).first().waitFor();
+  await page.screenshot({ path: "artifacts/v2-scan-desktop.png", fullPage: true });
+  await page.goto(app.origin + "/track");
+  await page.locator("#tabCopy").click();
+  await page.locator("#cpNew").click();
+  await page.locator("#cpDlg").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#cpDry").isChecked(), true);
+  await page.locator("#cpClose").click();
+  await page.screenshot({ path: "artifacts/v2-copy-desktop.png", fullPage: true });
   await page.getByRole("button", { name: "锁定网站", exact: true }).click();
   await page.waitForURL(app.origin + "/login");
-  const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true });
+  const mobile = await browser.newPage({ locale: "zh-CN", viewport: { width: 390, height: 844 }, isMobile: true });
   mobile.on("pageerror", error => failures.push(error.message));
   await mobile.route("**/api/scan", route => route.fulfill({ json: { tokens: [], errors: [] } }));
   await mobile.goto(app.origin + "/login");
@@ -79,9 +99,26 @@ try {
   await mobile.screenshot({ path: "artifacts/terminal-mobile.png", fullPage: true });
   assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= 390 && innerWidth <= 390), "Mobile terminal overflows viewport");
   assert.deepEqual(failures, []);
+  const english = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 1000 } });
+  english.on("pageerror", error => failures.push(error.message));
+  await english.route("**/api/scan", route => route.fulfill({ json: { tokens: [], errors: [] } }));
+  await english.goto(app.origin + "/login");
+  await english.locator("#password").fill(testPassword); await english.locator("#submit").click();
+  await english.waitForURL(app.origin + "/");
+  await english.waitForFunction(() => window.UI_LANG === "en");
+  assert.equal(await english.evaluate(() => tr("状态待核对")), "Awaiting verification");
+  await english.evaluate(() => {
+    document.getElementById("ordS").textContent = "状态待核对";
+    document.getElementById("ordL").textContent = "状态待核对:原始 CLI 日志";
+  });
+  await english.waitForFunction(() => document.getElementById("ordS").textContent === "Awaiting verification");
+  assert.equal(await english.locator("#ordL").textContent(), "状态待核对:原始 CLI 日志");
+  await english.getByRole("button", { name: "Lock website", exact: true }).click();
+  await english.waitForURL(app.origin + "/login");
+  await english.close();
   const setupApp = await startFixture({ bootstrap: true });
   try {
-    const setupPage = await browser.newPage();
+    const setupPage = await browser.newPage({ locale: "zh-CN" });
     setupPage.on("pageerror", error => failures.push(error.message));
     await setupPage.route("**/api/scan", route => route.fulfill({ json: { tokens: [], errors: [] } }));
     await setupPage.goto(`${setupApp.origin}/login#setup=${"b".repeat(64)}`);

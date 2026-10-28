@@ -13,8 +13,11 @@
   document.addEventListener("DOMContentLoaded", () => {
     const top = document.querySelector(".top");
     if (!top) return;
+    const style = document.createElement("style");
+    style.textContent = ".top{height:auto;min-height:50px;flex:0 0 auto;flex-wrap:wrap}.site-lock{flex:0 0 auto;white-space:nowrap}";
+    document.head.appendChild(style);
     const button = document.createElement("button");
-    button.textContent = "锁定网站"; button.className = "setbtn"; button.type = "button";
+    button.textContent = "锁定网站"; button.className = "setbtn site-lock"; button.type = "button";
     button.title = "退出网站访问，不退出 Binance 钱包";
     button.addEventListener("click", async () => {
       button.disabled = true;

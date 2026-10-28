@@ -41,7 +41,13 @@ import { addresses } from "./session.mjs";
 import { sessions, loginStart, loginStatus, logout, unpin, startDropoutWatch } from "./session.mjs";
 import { startTrack, trackList, trackAdd, trackUpdate, trackRemove, trackGroup, trackRebackfill, trackFeed } from "./track.mjs";
 import { quote } from "./quote.mjs";
+import { route, enforceBnbLimit } from "./order-route.mjs";
+import { consumeOrderLines, redactOrderOutput } from "./order-output.mjs";
 import { bnbUsd } from "./prices.mjs";
+import { initCopy, copyState, copyTask, copyPauseAll } from "./copy.mjs";
+import { startFlapNft } from "./flapnft.mjs";
+import { cacheStatus } from "./cache.mjs";
+import { startUpdateCheck, updateStatus } from "./update.mjs";
 import { startAutoTransfer, list as atList, setWatch as atSet, target as atTarget, setTarget as atSetTarget, setAppConfirm as atSetAppConfirm } from "./autotransfer.mjs";
 
 // 从最近成交算:买/卖笔数、成交额、5 分钟 / 1 小时涨幅(价格是曲线价,底池币计价)
@@ -59,6 +65,8 @@ function tradeStats(items) {
 }
 
 const PORT = Number(process.env.PANEL_PORT || 4400);
+const release = JSON.parse(readFileSync(new URL("../release.json", import.meta.url), "utf8"));
+const healthBody = () => ({ ok: true, version: release.version, commit: /^[a-f0-9]{7,40}$/i.test(process.env.RENDER_GIT_COMMIT || "") ? process.env.RENDER_GIT_COMMIT.slice(0, 12) : null });
 const passwordFile = statePath("website-password.hash");
 let savedPasswordHash;
 try { savedPasswordHash = readFileSync(passwordFile, "utf8").trim(); } catch {}
@@ -154,51 +162,91 @@ async function tickerOf(ca) {
 }
 
 // 按识别结果选脚本;返回 { script, args, env? } 或抛错
-function route(d, action, acct, arg, appConfirm = false) {
-  const ca = d.ca, A = ["--acct", acct];
-  // 按比例买:1pct / half,或自定义 p0.3(= 总量的 0.3%,0.01–1)
-  const pctOf = arg === "1pct" ? 1 : arg === "half" ? 0.5 : /^p\d/.test(String(arg)) ? Number(String(arg).slice(1)) : null;
-  const isPct = pctOf !== null;
-  const bnb = isPct ? null : arg;
-  if (action === "sell") {
-    const pct = arg;
-    if (d.platform === "four") return fourEnv(acct, { script: SHARE + "foursell.mjs", args: [ca, pct, "--slip", "10"] });
-    if (d.platform === "idagent") return { script: AGENTBUY + "sell.mjs", args: [ca, pct, ...A] };
-    if (d.stage === "outer") return { script: AGENTBUY + "dexsell.mjs", args: [ca, pct, ...A] };
-    if (d.platform === "gangv1") return { script: AGENTBUY + "gang/gangv1sell.mjs", args: [ca, "--pct", pct, ...A, ...(appConfirm ? ["--app-confirm"] : [])] };
-    if (d.platform === "gangv2") return { script: AGENTBUY + "gang/gangv2sell.mjs", args: [ca, pct, ...A, ...(appConfirm ? ["--app-confirm"] : [])] };
-    throw new Error("不知道怎么卖这个币");
-  }
-  // buy
-  if (d.stage === "outer" || d.platform === "dex") {
-    if (!bnb) throw new Error("外盘买入请填 BNB 数量");
-    return { script: AGENTBUY + "dexbuy.mjs", args: [ca, bnb, ...A] };
-  }
-  if (d.platform === "four") {
-    let budget = bnb;
-    if (isPct) {
-      const c = d.cost1pct ? d.cost1pct * pctOf : null;   // 买 1% 的报价 × 比例
-      if (!c) throw new Error("报不出买 1% 的价格,请改填 BNB 数量");
-      budget = (Math.ceil(c * 1.05 * 1e5) / 1e5).toFixed(5);   // 多带 5%,超过 1% 的部分脚本会自动卡住,多的退回
+// 跑下单脚本(手动下单和跟单共用):plans 来自 route();每行输出回调 onLine(账号, 行);
+//   结束时返回 { worst, results: { 账号: { code, out } } }。调用前已经检查过登录和 busy,这里负责占用 / 释放 busy
+function execOrder(d, action, plans, { arg, t0 = Date.now(), clientTs = null, onLine = () => {} } = {}) {
+  plans.forEach((p) => busy.add(p.a));
+  return new Promise((done) => {
+    let left = plans.length, worst = 0;
+    const results = {};
+    for (const p of plans) {
+      const env = { ...(p.env ?? process.env) };
+      if (p.fourAcct) env.FOURBUY_WALLET = d.wallets[p.fourAcct];
+      const report = line => { try { onLine(p.a, redactOrderOutput(line)); } catch {} };
+      report(`$ node ${p.script.split(/[\\/]/).slice(-2).join("/")} ${p.args.join(" ")}`);
+      const out = [];
+      const ps = spawn(process.execPath, [p.script, ...p.args], { env, cwd: AGENTBUY, windowsHide: true });
+      // 耗时:预览通过、交易提交的时间点(相对服务器收到请求)
+      const steps = {};
+      const mark = (l) => {
+        if (!steps.preview && /preview 通过|模拟:|已提交/.test(l)) steps.preview = Date.now() - t0;
+        if (!steps.submitted && /已提交|txHash|0x[0-9a-f]{64}/i.test(l)) steps.submitted = Date.now() - t0;
+        const tx = /(?:已提交|txHash).*?(0x[0-9a-f]{64})/i.exec(l); if (tx) steps.txHash = tx[1];
+      };
+      const pipe = stream => consumeOrderLines(stream, line => { mark(line); if (out.length < 200) out.push(line); report(line); });
+      pipe(ps.stdout); pipe(ps.stderr);
+      let finished = false;
+      const finish = (code) => {
+        if (finished) return; finished = true;
+        busy.delete(p.a);
+        if (code === 0 && action === "buy" && d.platform !== "idagent") noteToken(p.a, d.ca);   // 外盘买的也记下,持仓列表马上能显示
+        invalidate(d.ca);   // 自己下完单:成交列表 / K 线的缓存标成过期,下一次请求就会带上这笔
+        recordLatency({ ts: Date.now(), platform: d.platform, stage: d.stage, action, acct: p.a, arg, ok: code === 0, ms: Date.now() - t0,
+          clickToServer: Number(clientTs) > 0 ? Math.max(0, t0 - Number(clientTs)) : null, steps });
+        worst = Math.max(worst, code ?? 1);
+        results[p.a] = { code: code ?? 1, out, submitted: !!steps.submitted, txHash: steps.txHash || null };
+        report(code === 0 ? "✔ 结束" : code === 2 ? "⏳ 状态待核对" : `✘ 退出码 ${code}`);
+        if (--left === 0) done({ worst, results });
+      };
+      ps.once("error", () => finish(1));
+      ps.once("close", finish);
     }
-    return fourEnv(acct, { script: SHARE + "fourbuy.mjs", args: [ca, budget] });
+  });
+}
+// 跟单下单:只用已登录的钱包;钱包正有单在跑就最多等 30 秒;买入按 BNB 数量,Gang 内盘换算成占总量的比例
+async function copyOrder({ ca, action, accts, bnb, arg, slip, expiresAt, shouldProceed = () => true }) {
+  let started = false;
+  let free = [];
+  try {
+  const ss = await sessions();
+  const ok = accts.filter((a) => ss[a]?.connected);
+  if (!ok.length) throw new Error("跟单选的钱包都没登录");
+  for (let i = 0; i < 60 && ok.some((a) => busy.has(a)) && shouldProceed(); i++) await new Promise((r) => setTimeout(r, 500));
+  if (!shouldProceed() || Date.now() > expiresAt) throw new Error("任务已暂停或超过跟单时限");
+  free = ok.filter((a) => !busy.has(a));
+  if (!free.length) throw new Error("钱包一直有单在跑,这次没跟");
+  free.forEach((a) => busy.add(a));   // 马上占住,和检查之间没有 await
+  const d = await detectCached(ca, 4_000);
+  if (d.stage !== "inner") throw new Error("该币已毕业或不在内盘,本次跟单跳过,不自动改走外盘");
+  if (action === "buy") {
+    checkMaxBuy(bnb);
+    if (d.stage === "inner" && d.platform?.startsWith("gang")) {
+      const px = d.quote === "BNB" ? null : await bnbUsd();
+      const per1 = d.quote === "BNB" ? d.cost1pct : d.cost1pct && d.quoteUsd && px ? (d.cost1pct * d.quoteUsd) / px : null;
+      if (!per1) throw new Error("Gang 盘报不出买 1% 的价格");
+      const pct = bnb / per1 / 1.05;
+      if (pct < 0.01) throw new Error(`${bnb} BNB 不到总量 0.01%,Gang 内盘买不了这么少`);
+      arg = "p" + Math.min(1, pct).toFixed(4);
+    } else arg = String(bnb);
   }
-  if (d.platform === "gangv1" || d.platform === "gangv2") {
-    if (!isPct) throw new Error("Gang 内盘请用「买 1% / 买 0.5%」");
-    const script = AGENTBUY + (d.platform === "gangv1" ? "gang/gangv1buy.mjs" : "gang/gangbuy.mjs");
-    // 1% = 1000 万个(总量 10 亿);买 1% 时不传 --tokens,脚本按剩余额度买满
-    return { script, args: [ca, ...(pctOf < 1 ? ["--tokens", String(Math.round(pctOf * 1e7))] : []), ...A] };
+  const plans = free.map((a) => ({ a, ...route(d, action, a, arg, false) }));
+  enforceBnbLimit(d, action, plans, bnb);
+  if (Number(slip) > 0) for (const p of plans) {
+    const i = p.args.indexOf("--slip");
+    if (i >= 0) p.args[i + 1] = String(Number(slip)); else p.args.push("--slip", String(Number(slip)));
   }
-  if (d.platform === "idagent") {
-    if (!bnb) throw new Error("Flap 内盘请填 BNB 数量");
-    return { script: AGENTBUY + "fast.mjs", args: [ca, bnb, ...A, "--wait"] };
-  }
-  throw new Error("不知道怎么买这个币");
+  if (!shouldProceed() || Date.now() > expiresAt) throw new Error("任务已暂停或超过跟单时限");
+  started = true;
+  const r = await execOrder(d, action, plans, { arg });
+  const results = {};
+  for (const [a, x] of Object.entries(r.results)) results[a] = { ok: x.code === 0, submitted: x.submitted, txHash: x.txHash, last: x.out.slice(-2) };
+  for (const a of ok.filter((a) => !free.includes(a))) results[a] = { ok: false, submitted: false, last: ["钱包一直有单在跑,跳过"] };
+  for (const a of accts.filter((a) => !ok.includes(a))) results[a] = { ok: false, submitted: false, last: ["没登录,跳过"] };
+  return { results, symbol: d.symbol };
+  } catch (error) { if (!started) error.code = "ORDER_NOT_STARTED"; throw error; }
+  finally { if (!started) free.forEach((a) => busy.delete(a)); }
 }
 // four 的脚本没有 --acct:用环境变量 AGENTBUY_ACCT 选账号 + FOURBUY_WALLET 给地址
-function fourEnv(acct, cmd) {
-  return { ...cmd, env: { ...process.env, AGENTBUY_ACCT: acct }, fourAcct: acct };
-}
 
 function guard(req, token) {
   access.checkOrigin(req);
@@ -228,13 +276,13 @@ const server = http.createServer(async (req, res) => {
   // is exempt; every wallet, login and trading route keeps the checks below.
   if (access.web && process.env.PANEL_HOSTED_HEALTH === "1" && ["GET", "HEAD"].includes(req.method) && req.url === "/health") {
     if (req.method === "HEAD") { res.writeHead(200); return res.end(); }
-    return json(res, 200, { ok: true });
+    return json(res, 200, healthBody());
   }
   try { access.checkOrigin(req); } catch (e) { return json(res, 403, { error: e.message }); }
   const browserSession = access.session(req);
   const requestToken = access.web ? browserSession?.csrf : TOKEN;
   if (access.web) {
-    if (req.method === "GET" && req.url === "/health") return json(res, 200, { ok: true });
+    if (req.method === "GET" && req.url === "/health") return json(res, 200, healthBody());
     if (req.method === "GET" && req.url === "/login") {
       if (browserSession) { res.writeHead(303, { location: "/" }); return res.end(); }
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'" });
@@ -262,6 +310,7 @@ const server = http.createServer(async (req, res) => {
       for (const stream of streams) if (stream.browserSession === browserSession) { stream.end(); streams.delete(stream); }
       return json(res, 200, { ok: true });
     }
+    if (req.method === "GET" && req.url === "/api/release") return json(res, 200, release);
     if (req.method === "GET" && req.url === "/api/site") return json(res, 200, { web: access.web });
     if (req.method === "GET" && req.url === "/web-session.js" && access.web) {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
@@ -284,12 +333,43 @@ const server = http.createServer(async (req, res) => {
       if (req.url === "/api/track/backfill") return json(res, 200, trackRebackfill(b));
       if (req.url === "/api/track/feed") return json(res, 200, trackFeed(b));
     }
+    // 跟单:任务在本机 panel/copy-tasks.json;新建时目标还没追踪就先加进追踪列表(跟单靠追踪的实时动态触发)
+    if (req.method === "POST" && req.url.startsWith("/api/copy")) {
+      const b = await body(req);
+      if (req.url === "/api/copy") return json(res, 200, copyState());
+      if (req.url === "/api/copy/pause-all") return json(res, 200, copyPauseAll(b.paused, b.confirmLive === true));
+      if (req.url === "/api/copy/tasks") {
+        if (b.target !== undefined && !b.id) {
+          if (!ethers.isAddress(b.target)) throw new Error("目标地址格式不对");
+          if (!trackList().targets.some((t) => t.address === b.target.toLowerCase())) await trackAdd({ input: b.target });
+          const t = trackList().targets.find((x) => x.address === b.target.toLowerCase());
+          if (!b.name) b.name = t?.name || t?.handle || "";
+        }
+        return json(res, 200, copyTask(b));
+      }
+    }
     if (req.method === "GET" && req.url === "/scan") {
       const html = pageHtml("./scan.html", requestToken);
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'self'; img-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'" });
       return res.end(html);
     }
     // 本地图表库(TradingView Lightweight Charts 4.2.0,Apache-2.0,和官方发布文件逐字节一致)
+    // 中英文切换(页面加载时最先执行)
+    // 新版本提醒:页面脚本 + 状态(只读公开的版本号,不含任何本机信息,GET 不要令牌)
+    // 三个页面共用:数字 / 时间格式、单色图标
+    if (req.method === "GET" && (req.url === "/fmt.js" || req.url === "/icons.js")) {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" });
+      return res.end(readFileSync(here("." + req.url)));
+    }
+    if (req.method === "GET" && req.url === "/update.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" });
+      return res.end(readFileSync(here("./update.js")));
+    }
+    if (req.method === "GET" && req.url === "/api/update-status") return json(res, 200, updateStatus());
+    if (req.method === "GET" && req.url === "/i18n.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" });
+      return res.end(readFileSync(here("./i18n.js")));
+    }
     // TM 图标(浏览器标签页)
     if (req.method === "GET" && (req.url === "/favicon.svg" || req.url === "/favicon.ico")) {
       res.writeHead(200, { "content-type": "image/svg+xml", "cache-control": "private, max-age=86400" });
@@ -330,6 +410,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && req.url === "/api/live-status") return json(res, 200, liveStatus());
+    if (req.method === "POST" && req.url === "/api/cache-status") return json(res, 200, await cacheStatus());
     if (req.method === "GET" && req.url === "/health") return json(res, 200, { busy: busy.size });   // 守护进程重启前看有没有单在跑
     if (req.method === "POST" && req.url === "/api/scan") { const { force, lite } = await body(req); const d = await scan({ force: force === true }); return json(res, 200, lite === true ? scanLite(d) : d); }
     if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/?"))) {
@@ -349,7 +430,7 @@ const server = http.createServer(async (req, res) => {
       if (!ethers.isAddress(ca)) throw new Error("CA 格式不对");
       detectCached(ca, 4_000).then((d) => Promise.all([
         costsFor(d.ca, d.holdings),
-        ["four", "gangv1", "gangv2"].includes(d.platform) ? recentTrades(d.ca, d.platform) : null,
+        ["four", "gangv1", "gangv2", "gangv3"].includes(d.platform) ? recentTrades(d.ca, d.platform) : null,
       ])).catch(() => {});
       return json(res, 200, { ok: true });
     }
@@ -361,7 +442,7 @@ const server = http.createServer(async (req, res) => {
       // 买入成本(从交易记录算)和最近成交(成交统计 + four 的市值)同时拉,不一个等一个
       const [costs, tr] = await Promise.all([
         costsFor(d.ca, d.holdings).catch(() => ({})),
-        ["four", "gangv1", "gangv2"].includes(d.platform) ? recentTrades(d.ca, d.platform).catch(() => null) : null,
+        ["four", "gangv1", "gangv2", "gangv3"].includes(d.platform) ? recentTrades(d.ca, d.platform).catch(() => null) : null,
       ]);
       d.costs = costs;
       d.stats = tradeStats(tr?.items);
@@ -539,6 +620,10 @@ const server = http.createServer(async (req, res) => {
       const ss = await sessions();
       for (const a of accts) if (!ss[a]?.connected) throw new Error(`账号${a} 在这台电脑上没登录`);
       for (const a of accts) if (busy.has(a)) throw new Error(`账号${a} 还有一笔在跑,等它结束`);
+      // 检查完马上占住(和检查之间不能有 await,否则两个请求会同时通过);后面任何一步出错都要放开
+      accts.forEach((a) => busy.add(a));
+      let started = false;
+      try {
       const d = await detectCached(ca);   // 20 秒内识别过就直接用
       // 单笔上限:按 BNB 买直接比;按比例买用报出来的花费(底池不是 BNB 的按美元价换算成 BNB)
       if (action === "buy") {
@@ -548,42 +633,22 @@ const server = http.createServer(async (req, res) => {
           const px = await bnbUsd();
           bnb = d.quote === "BNB" ? cost : cost && d.quoteUsd && px ? (cost * d.quoteUsd) / px : null;
         }
-        if (bnb) checkMaxBuy(bnb);
+        checkMaxBuy(bnb);   // 算不出 BNB(bnb 为空)时,设了单笔上限就直接拒绝
       }
       const plans = accts.map((a) => ({ a, ...route(d, action, a, arg, appConfirm === true) }));
+      enforceBnbLimit(d, action, plans, settings().maxBuyBnb);
       // 选了滑点就加 --slip(不选用各脚本自己的默认值)
       if (Number(slip) > 0) for (const p of plans) {
         const i = p.args.indexOf("--slip");
         if (i >= 0) p.args[i + 1] = String(Number(slip)); else p.args.push("--slip", String(Number(slip)));
       }
-      accts.forEach((a) => busy.add(a));
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "x-accel-buffering": "no" });
       res.write(`识别:${d.platformLabel} · ${d.stage === "inner" ? "内盘" : "外盘"} · ${d.symbol}\n`);
-      let left = plans.length, worst = 0;
-      for (const p of plans) {
-        const env = p.env ?? process.env;
-        if (p.fourAcct) env.FOURBUY_WALLET = d.wallets[p.fourAcct];
-        res.write(`[账号${p.a}] $ node ${p.script.split(/[\\/]/).slice(-2).join("/")} ${p.args.join(" ")}\n`);
-        const ps = spawn(process.execPath, [p.script, ...p.args], { env, cwd: AGENTBUY, windowsHide: true });
-        // 耗时:预览通过、交易提交的时间点(相对服务器收到请求)
-        const steps = {};
-        const mark = (l) => {
-          if (!steps.preview && /preview 通过|模拟:|已提交/.test(l)) steps.preview = Date.now() - t0;
-          if (!steps.submitted && /已提交|txHash|0x[0-9a-f]{64}/i.test(l)) steps.submitted = Date.now() - t0;
-        };
-        const pipe = (s) => s.on("data", (b) => String(b).split(/\r?\n/).filter(Boolean).forEach((l) => { mark(l); res.write(`[账号${p.a}] ${l}\n`); }));
-        pipe(ps.stdout); pipe(ps.stderr);
-        ps.on("close", (code) => {
-          busy.delete(p.a);
-          if (code === 0 && action === "buy" && d.platform !== "idagent") noteToken(p.a, ca);   // 外盘买的也记下,持仓列表马上能显示
-          recordLatency({ ts: Date.now(), platform: d.platform, stage: d.stage, action, acct: p.a, arg, ok: code === 0, ms: Date.now() - t0,
-            clickToServer: Number(clientTs) > 0 ? Math.max(0, t0 - Number(clientTs)) : null, steps });
-          worst = Math.max(worst, code ?? 1);
-          res.write(`[账号${p.a}] ${code === 0 ? "✔ 结束" : `✘ 退出码 ${code}`}\n`);
-          if (--left === 0) { res.write(`__DONE__ ${worst}\n`); res.end(); }
-        });
-      }
+      started = true;
+      execOrder(d, action, plans, { arg, t0, clientTs, onLine: (a, l) => res.write(`[账号${a}] ${l}\n`) })
+        .then((r) => { res.write(`__DONE__ ${r.worst}\n`); res.end(); });
       return;
+      } finally { if (!started) accts.forEach((a) => busy.delete(a)); }
     }
     json(res, 404, { error: "没有这个接口" });
   } catch (e) {
@@ -596,6 +661,9 @@ server.listen(PORT, access.web ? (process.env.PANEL_HOST || "0.0.0.0") : "127.0.
   if (process.env.PANEL_BACKGROUND === "0") return;
   walletsOverview().catch(() => {});   // 启动就先算一遍账户总览,第一次打开页面不用等
   startAutoTransfer(busy);
+  startUpdateCheck();   // 每 6 小时看一次 GitHub 上有没有重大更新
+  startFlapNft().catch((e) => console.error("[Flap 门槛盘] 启动失败", e.message));   // 后台:发现门槛盘(首次往回补约 4 天)
+  initCopy({ order: copyOrder, detect: (ca) => detectCached(ca, 20_000), notify: (text) => { tg(text); bus.emit("event", { type: "notice", text }); } });
   // 已登录的号掉线了:推页面(弹窗 + 提示音 + 浏览器通知)+ TG
   startDropoutWatch((acct, pin) => {
     bus.emit("event", { type: "dropout", acct, address: pin });

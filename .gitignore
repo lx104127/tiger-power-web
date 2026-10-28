@@ -46,3 +46,9 @@ artifacts/
 **/website-setup.json
 **/temporary-entry.json
 **/temporary-origin.json
+
+panel/copy-tasks.json
+panel/copy-log.jsonl
+panel/flapnft.json
+panel/cache.db
+panel/cache.db-*

@@ -7,7 +7,7 @@ import { ethers } from "ethers";
 import { takeAcct, bawSpawn, runBoth, BAW2_ENTRY, BAW2_DIR } from "../accounts.mjs";
 import { makeGang } from "./gangcore.mjs";
 import { checkLiquid } from "../liq.mjs";
-import { tokenToBnb } from "../quoteswap.mjs";
+import { tokenToBnb, quoteDecimals } from "../quoteswap.mjs";
 
 const WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
 const net = ethers.Network.from(56);
@@ -86,6 +86,7 @@ if (bal === 0n) die(`${W} 没有 ${info.symbol}`);
 const amount = (bal * BigInt(Math.round(Number(pctRaw) * 100))) / 10000n;
 const amountStr = ethers.formatEther(amount);
 const quote = ethers.getAddress(info.quote);
+const qDec = await quoteDecimals(quote);   // XAUt 是 6 位,其他底池币 18 位
 log(`${info.symbol} ${ca}  卖 ${amountStr} 个(持仓 ${info.myBalance} 的 ${pctRaw}%),内盘滑点 ${slip}%,拿回底池币 ${quote}`);
 
 const sellArgs = Number(pctRaw) === 100 ? ["sell", "--token", ca, "--all", "--slippage", slip] : ["sell", "--token", ca, "--amount", amountStr, "--slippage", slip];
@@ -122,6 +123,6 @@ if (quote.toLowerCase() === WBNB) {
 { const lq = await checkLiquid(quote); if (!lq.ok) { log(`⚠️ ${lq.msg}。卖出已完成,底池币留在钱包里(面板「底池币余额」可以之后再换)`); process.exit(0); } }
 // Ondo 类底池币(FXIon 等)自动经 USDT 中转换回 BNB
 let bnbBack;
-try { bnbBack = await tokenToBnb({ baw, wallet: W, token: quote, amountWei: got, slip: swapSlip, balanceOf, log }); }
+try { bnbBack = await tokenToBnb({ baw, wallet: W, token: quote, amountWei: got, decimals: qDec, slip: swapSlip, balanceOf, log }); }
 catch (e) { die(`底池币换 BNB 失败(卖出已完成,底池币 / USDT 留在钱包里,面板「底池币余额」可以之后再换):${e.message}`); }
 log(`✓ 完成,底池币换回 ${ethers.formatEther(bnbBack)} BNB`);

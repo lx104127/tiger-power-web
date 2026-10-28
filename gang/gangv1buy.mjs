@@ -29,6 +29,9 @@ const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? (args.splice(i,
 const opt = (n) => { const i = args.indexOf(n); if (i < 0) return null; const v = args[i + 1]; args.splice(i, 2); return v; };
 const DRY = flag("--dry");
 const wantTokens = opt("--tokens");
+const maxBnbRaw = opt("--max-bnb");
+const maxBnb = maxBnbRaw === null ? null : Number(maxBnbRaw);
+if (maxBnb !== null && !(Number.isFinite(maxBnb) && maxBnb > 0)) die("--max-bnb 必须为正数");
 const buffer = Number(opt("--buffer") ?? "3"), slip = Number(opt("--slip") ?? "1");
 const cas = args;
 if (!cas.length || cas.some((c) => !ethers.isAddress(c))) die("用法 node gangv1buy.mjs <CA> [CA ...] [--tokens 数量] [--buffer 3] [--slip 1] [--acct 1|2|both] [--dry]");
@@ -62,6 +65,7 @@ for (const raw of cas) {
   let need = q.bnbIn + q.fee;
   if (wantTokens && q.tokensOut > target) need = (need * target) / q.tokensOut;
   const value = (need * BigInt(Math.round((100 + buffer) * 100))) / 10000n;
+  if (maxBnb !== null && value > ethers.parseEther(String(maxBnb))) { log(`✗ 所需 ${ethers.formatEther(value)} BNB 超过上限 ${maxBnb} BNB,不提交`); failed++; continue; }
   const outTarget = q.tokensOut < target ? q.tokensOut : target;
   const minOut = (outTarget * BigInt(Math.round((100 - slip) * 100))) / 10000n;
   log(`${sym} ${ca}  买 ${ethers.formatEther(outTarget)} 个,约需 ${ethers.formatEther(need)} BNB,发送 ${ethers.formatEther(value)}(多的退回),最少 ${ethers.formatEther(minOut)}`);

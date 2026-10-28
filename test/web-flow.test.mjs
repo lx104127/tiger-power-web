@@ -6,9 +6,11 @@ import { startFixture, testPassword } from "./helpers.mjs";
 
 test("website authentication gates trading; wallet login, address pinning and logout remain isolated", async t => {
   const app = await startFixture(); t.after(() => app.stop());
+  const health = await fetch(app.origin + "/health").then(r => r.json());
+  assert.equal(health.version, "2.0.0"); assert.deepEqual(Object.keys(health).sort(), ["commit", "ok", "version"]);
   const request = (path, data, headers = {}) => fetch(app.origin + path, { method: "POST", headers: { origin: app.origin, "content-type": "application/json", ...headers }, body: JSON.stringify(data) });
   assert.equal((await fetch(app.origin, { redirect: "manual" })).status, 303);
-  for (const route of ["/api/wallets", "/api/run", "/api/login/start"]) assert.equal((await request(route, {})).status, 401);
+  for (const route of ["/api/wallets", "/api/run", "/api/login/start", "/api/copy", "/api/copy/tasks", "/api/copy/pause-all", "/api/cache-status"]) assert.equal((await request(route, {})).status, 401);
   assert.equal((await fetch(app.origin + "/api/stream?t=anything")).status, 401);
   assert.equal((await request("/auth/login", { password: testPassword }, { origin: "https://evil.example" })).status, 403);
   const login = await request("/auth/login", { password: testPassword }); assert.equal(login.status, 200);
@@ -18,6 +20,12 @@ test("website authentication gates trading; wallet login, address pinning and lo
   assert.ok(html.includes("/web-session.js"));
   assert.equal((await request("/api/login/start", { acct: "1" }, { cookie })).status, 403);
   const headers = { cookie, "x-panel-token": token };
+  const copying = await request("/api/copy", {}, headers).then(r => r.json());
+  assert.deepEqual(copying.tasks, []); assert.equal(copying.defaults.dryRun, true);
+  assert.equal((await request("/api/copy/pause-all", { paused: true }, { cookie })).status, 403);
+  assert.equal((await request("/api/copy/tasks", { target: "invalid" }, headers)).status, 400);
+  const cache = await request("/api/cache-status", {}, headers).then(r => r.json());
+  assert.equal(cache.backend, "sqlite");
   const first = await request("/api/login/start", { acct: "1" }, headers).then(r => r.json());
   assert.equal(first.code, "TEST01"); assert.ok(first.svg.includes("<svg"));
   const second = await request("/api/login/start", { acct: "2" }, headers).then(r => r.json());
