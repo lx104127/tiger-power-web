@@ -1,0 +1,44 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { startFixture, testPassword } from "./helpers.mjs";
+
+test("website authentication gates trading; wallet login, address pinning and logout remain isolated", async t => {
+  const app = await startFixture(); t.after(() => app.stop());
+  const request = (path, data, headers = {}) => fetch(app.origin + path, { method: "POST", headers: { origin: app.origin, "content-type": "application/json", ...headers }, body: JSON.stringify(data) });
+  assert.equal((await fetch(app.origin, { redirect: "manual" })).status, 303);
+  for (const route of ["/api/wallets", "/api/run", "/api/login/start"]) assert.equal((await request(route, {})).status, 401);
+  assert.equal((await fetch(app.origin + "/api/stream?t=anything")).status, 401);
+  assert.equal((await request("/auth/login", { password: testPassword }, { origin: "https://evil.example" })).status, 403);
+  const login = await request("/auth/login", { password: testPassword }); assert.equal(login.status, 200);
+  const cookie = login.headers.get("set-cookie").split(";")[0];
+  const html = await fetch(app.origin, { headers: { cookie } }).then(r => r.text());
+  const token = html.match(/const TOKEN_INIT = "([a-f0-9]{48})"/)[1];
+  assert.ok(html.includes("/web-session.js"));
+  assert.equal((await request("/api/login/start", { acct: "1" }, { cookie })).status, 403);
+  const headers = { cookie, "x-panel-token": token };
+  const first = await request("/api/login/start", { acct: "1" }, headers).then(r => r.json());
+  assert.equal(first.code, "TEST01"); assert.ok(first.svg.includes("<svg"));
+  const second = await request("/api/login/start", { acct: "2" }, headers).then(r => r.json());
+  assert.equal(second.code, "TEST02"); assert.notEqual(first.url, second.url);
+  for (let i = 0; i < 30; i++) {
+    const states = await Promise.all(["1", "2"].map(acct => request("/api/login/status", { acct }, headers).then(r => r.json())));
+    if (states.every(s => s.state === "ok")) break;
+    if (i === 29) assert.fail(JSON.stringify(states));
+    await new Promise(r => setTimeout(r, 100));
+  }
+  const pins = JSON.parse(await readFile(join(app.data, "panel/wallet-pins.json"), "utf8"));
+  assert.notEqual(pins["1"], pins["2"]);
+  const identities = await Promise.all(["1", "2"].map(acct => readFile(join(app.data, `wallets/${acct}/instance-id`), "utf8")));
+  assert.notEqual(...identities);
+  assert.equal((await request("/api/run", { ca: "invalid", action: "buy", acct: "both", arg: "1" }, headers)).status, 400);
+  assert.equal((await request("/api/login/logout", { acct: "1" }, headers)).status, 200);
+  const one = JSON.parse(await readFile(join(app.data, "wallets/2/fixture-session.json"), "utf8"));
+  assert.equal(one.address, pins["2"]);
+  const otherLogin = await request("/auth/login", { password: testPassword });
+  const otherCookie = otherLogin.headers.get("set-cookie").split(";")[0];
+  assert.equal((await request("/api/login/logout", { acct: "2" }, { cookie: otherCookie, "x-panel-token": token })).status, 403);
+  assert.equal((await request("/auth/logout", {}, headers)).status, 200);
+  assert.equal((await request("/api/login/start", { acct: "2" }, headers)).status, 401);
+});

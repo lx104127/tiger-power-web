@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: tiger-power-web
+    runtime: docker
+    plan: standard
+    region: frankfurt
+    numInstances: 1
+    autoDeploy: false
+    dockerfilePath: ./deploy/Render.Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    disk:
+      name: tiger-private-data
+      mountPath: /var/tiger-data
+      sizeGB: 1
+    envVars:
+      - key: PANEL_MODE
+        value: web
+      - key: PANEL_DATA_DIR
+        value: /var/tiger-data
+      - key: PANEL_REQUIRE_PERSISTENT_DATA
+        value: "1"

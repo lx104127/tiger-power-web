@@ -1,0 +1,20 @@
+services:
+  terminal:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PANEL_MODE: web
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 4400
+      PANEL_DATA_DIR: /app/data
+    ports:
+      - "127.0.0.1:4400:4400"
+    volumes:
+      - terminal-data:/app/data
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 5m
+volumes:
+  terminal-data:
